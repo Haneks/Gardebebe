@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
 import { TimeEntry } from '../types';
+import { useAuth } from './useAuth';
 
 // LocalStorage fallback functions
 const getEntriesFromStorage = (): TimeEntry[] => {
@@ -23,86 +24,89 @@ const saveEntriesToStorage = (entries: TimeEntry[]) => {
 export function useTimeEntries() {
   const [entries, setEntries] = useState<TimeEntry[]>([]);
   const [loading, setLoading] = useState(true);
+  const { user, isAuthenticated } = useAuth();
   const useSupabase = isSupabaseConfigured();
 
   useEffect(() => {
-    fetchEntries();
-  }, []);
-
-  const fetchEntries = async () => {
-    setLoading(true);
-    try {
-      if (useSupabase) {
-        try {
-          const { data, error } = await supabase
-            .from('time_entries')
-            .select('*')
-            .order('created_at', { ascending: false });
-
-          if (error) throw error;
-          setEntries(data || []);
-        } catch (supabaseError) {
-          console.warn('Supabase error, falling back to localStorage:', supabaseError);
-          // Fallback to localStorage if Supabase fails
-          const localEntries = getEntriesFromStorage();
-          setEntries(localEntries.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()));
-        }
-      } else {
-        // Use localStorage fallback
-        const localEntries = getEntriesFromStorage();
-        setEntries(localEntries.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()));
-      }
-    } catch (error) {
-      console.warn('Error loading entries, using localStorage fallback:', error);
-      // Fallback to localStorage even if Supabase fails
+    if (isAuthenticated && useSupabase) {
+      fetchEntries();
+    } else if (!useSupabase) {
+      // Use localStorage fallback for non-authenticated mode
       const localEntries = getEntriesFromStorage();
       setEntries(localEntries.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()));
+      setLoading(false);
+    } else {
+      setEntries([]);
+      setLoading(false);
+    }
+  }, [isAuthenticated, useSupabase]);
+
+  const fetchEntries = async () => {
+    if (!useSupabase || !user) {
+      setLoading(false);
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const { data, error } = await supabase
+        .from('time_entries')
+        .select(`
+          *,
+          children (
+            id,
+            name
+          )
+        `)
+        .eq('user_id', user.id)
+        .order('created_at', { ascending: false });
+
+      if (error) throw error;
+      setEntries(data || []);
+    } catch (error) {
+      console.error('Error fetching entries:', error);
+      setEntries([]);
     } finally {
       setLoading(false);
     }
   };
 
-  const addEntry = async (childName: string, entryType: 'arrival' | 'departure') => {
+  const addEntry = async (childId: string, childName: string, entryType: 'arrival' | 'departure', notes?: string) => {
     try {
       const now = new Date();
-      const newEntry: TimeEntry = {
-        id: crypto.randomUUID(),
-        child_name: childName,
-        entry_type: entryType,
-        timestamp: now.toISOString(),
-        created_at: now.toISOString(),
-      };
 
-      if (useSupabase) {
-        try {
-          const { data, error } = await supabase
-            .from('time_entries')
-            .insert({
-              child_name: childName,
-              entry_type: entryType,
-              timestamp: now.toISOString(),
-            })
-            .select()
-            .single();
-
-          if (error) throw error;
-          setEntries(prev => [data, ...prev]);
-        } catch (supabaseError) {
-          console.warn('Supabase error, falling back to localStorage:', supabaseError);
-          // Fallback to localStorage if Supabase fails
-          const newEntry: TimeEntry = {
-            id: crypto.randomUUID(),
+      if (useSupabase && user) {
+        const { data, error } = await supabase
+          .from('time_entries')
+          .insert({
+            user_id: user.id,
+            child_id: childId,
             child_name: childName,
             entry_type: entryType,
             timestamp: now.toISOString(),
-            created_at: now.toISOString(),
-          };
-          const updatedEntries = [newEntry, ...entries];
-          setEntries(updatedEntries);
-          saveEntriesToStorage(updatedEntries);
-        }
+            notes: notes || null
+          })
+          .select(`
+            *,
+            children (
+              id,
+              name
+            )
+          `)
+          .single();
+
+        if (error) throw error;
+        setEntries(prev => [data, ...prev]);
       } else {
         // Use localStorage fallback
+        const newEntry: TimeEntry = {
+          id: crypto.randomUUID(),
+          child_name: childName,
+          entry_type: entryType,
+          timestamp: now.toISOString(),
+          created_at: now.toISOString(),
+          notes
+        };
         const updatedEntries = [newEntry, ...entries];
         setEntries(updatedEntries);
         saveEntriesToStorage(updatedEntries);
@@ -110,27 +114,17 @@ export function useTimeEntries() {
       
       return { success: true };
     } catch (error) {
-      console.warn('Error adding entry, trying localStorage fallback:', error);
-      
-      // Try localStorage fallback even if Supabase fails
-      try {
-        const now = new Date();
-        const newEntry: TimeEntry = {
-          id: crypto.randomUUID(),
-          child_name: childName,
-          entry_type: entryType,
-          timestamp: now.toISOString(),
-          created_at: now.toISOString(),
-        };
-        const updatedEntries = [newEntry, ...entries];
-        setEntries(updatedEntries);
-        saveEntriesToStorage(updatedEntries);
-        return { success: true };
-      } catch (fallbackError) {
-        return { success: false, error: fallbackError };
-      }
+      console.error('Error adding entry:', error);
+      return { success: false, error };
     }
   };
 
-  return { entries, loading, addEntry, refetch: fetchEntries, useSupabase };
+  return { 
+    entries, 
+    loading, 
+    addEntry, 
+    refetch: fetchEntries, 
+    useSupabase,
+    isAuthenticated 
+  };
 }
